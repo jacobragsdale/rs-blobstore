@@ -4,7 +4,7 @@ Tiny, fast Rust HTTP service that stores arbitrary binary blobs on disk. Content
 
 ## Endpoints
 
-- `POST /blobs/<path>` — body = raw bytes. Returns `202 Accepted`. `503` if the write queue is full, `400` for unsafe paths, `413` for oversized bodies.
+- `POST /blobs/<path>` — body = raw bytes. Returns `202 Accepted`. Requires `Content-Length`. Returns `503` if the write queue is full or its byte budget is exhausted, `400` for unsafe paths, `411` for missing `Content-Length`, and `413` for oversized bodies.
 - `GET /blobs/<path>` — streams the file back. `404` if missing.
 - `GET /healthz` — `200 ok`.
 
@@ -17,6 +17,7 @@ The `<path>` can have any extension (`.parquet.gz`, `.pkl`, `.npy`, `.bin`, …)
 | `STORAGE_ROOT` | `/data` |
 | `BIND_ADDR` | `0.0.0.0:8080` |
 | `WRITE_QUEUE_CAPACITY` | `1024` |
+| `WRITE_QUEUE_MAX_BYTES` | `8589934592` (8 GiB) |
 | `WRITE_WORKERS` | `4` |
 | `MAX_BODY_BYTES` | `1073741824` (1 GiB) |
 | `RUST_LOG` | `info` |

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, State},
-    http::{header, StatusCode},
+    extract::{FromRequest, Path, State},
+    http::{header, HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -14,12 +14,20 @@ use tokio::sync::mpsc;
 use tokio_util::io::ReaderStream;
 
 use crate::path::resolve_safe;
-use crate::writer::WriteJob;
+use crate::writer::{ByteBudget, ByteBudgetError, WriteJob};
+
+const GET_STREAM_CAPACITY: usize = 256 * 1024;
+
+enum ContentLengthError {
+    Missing,
+    Invalid,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub storage_root: Arc<PathBuf>,
     pub tx: mpsc::Sender<WriteJob>,
+    pub queue_byte_budget: Arc<ByteBudget>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -36,7 +44,7 @@ async fn healthz() -> &'static str {
 async fn post_blob(
     State(state): State<AppState>,
     Path(path): Path<String>,
-    body: Bytes,
+    req: Request<Body>,
 ) -> Response {
     let safe_path = match resolve_safe(&state.storage_root, &path) {
         Ok(p) => p,
@@ -46,20 +54,43 @@ async fn post_blob(
         }
     };
 
+    let body_len = match content_length(req.headers()) {
+        Ok(len) => len,
+        Err(e) => return content_length_error(e),
+    };
+
+    let permit = match state.tx.clone().try_reserve_owned() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "write queue full, retry").into_response();
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "writer shut down").into_response();
+        }
+    };
+
+    let mut byte_reservation = match state.queue_byte_budget.try_reserve(body_len) {
+        Ok(reservation) => reservation,
+        Err(e) => return queue_byte_budget_error(e, state.queue_byte_budget.max_bytes()),
+    };
+
+    let body = match Bytes::from_request(req, &state).await {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    if let Err(e) = byte_reservation.resize(body.len()) {
+        return queue_byte_budget_error(e, state.queue_byte_budget.max_bytes());
+    }
+
     let job = WriteJob {
         path: safe_path,
         bytes: body,
+        _byte_reservation: byte_reservation,
     };
 
-    match state.tx.try_send(job) {
-        Ok(_) => StatusCode::ACCEPTED.into_response(),
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, "write queue full, retry").into_response()
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "writer shut down").into_response()
-        }
-    }
+    permit.send(job);
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn get_blob(State(state): State<AppState>, Path(path): Path<String>) -> Response {
@@ -83,7 +114,7 @@ async fn get_blob(State(state): State<AppState>, Path(path): Path<String>) -> Re
     };
 
     let len = file.metadata().await.ok().map(|m| m.len());
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::with_capacity(file, GET_STREAM_CAPACITY);
     let body = Body::from_stream(stream);
 
     let mut builder = Response::builder()
@@ -98,5 +129,43 @@ async fn get_blob(State(state): State<AppState>, Path(path): Path<String>) -> Re
             tracing::error!(error = %e, "build response failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+fn content_length(headers: &HeaderMap) -> Result<usize, ContentLengthError> {
+    let Some(value) = headers.get(header::CONTENT_LENGTH) else {
+        return Err(ContentLengthError::Missing);
+    };
+
+    value
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or(ContentLengthError::Invalid)
+}
+
+fn content_length_error(error: ContentLengthError) -> Response {
+    match error {
+        ContentLengthError::Missing => {
+            (StatusCode::LENGTH_REQUIRED, "content-length required").into_response()
+        }
+        ContentLengthError::Invalid => {
+            (StatusCode::BAD_REQUEST, "invalid content-length").into_response()
+        }
+    }
+}
+
+fn queue_byte_budget_error(error: ByteBudgetError, max_bytes: usize) -> Response {
+    match error {
+        ByteBudgetError::Full => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write queue byte limit reached, retry",
+        )
+            .into_response(),
+        ByteBudgetError::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("body exceeds write queue byte limit of {max_bytes} bytes"),
+        )
+            .into_response(),
     }
 }

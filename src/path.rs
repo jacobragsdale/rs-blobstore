@@ -24,19 +24,6 @@ pub fn resolve_safe(root: &Path, user_path: &str) -> Result<PathBuf> {
     }
 
     let joined = root.join(p);
-
-    let mut depth: i32 = 0;
-    for c in Path::new(user_path).components() {
-        match c {
-            Component::Normal(_) => depth += 1,
-            Component::ParentDir => depth -= 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return Err(anyhow!("path escapes root"));
-        }
-    }
-
     Ok(joined)
 }
 
